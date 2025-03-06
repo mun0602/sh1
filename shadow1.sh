@@ -8,27 +8,24 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
-# Cập nhật hệ thống
-echo "Đang cập nhật hệ thống..."
+# Cập nhật repository (không upgrade hệ thống)
+echo "Đang cập nhật danh sách package..."
 apt-get update -y
-apt-get upgrade -y
 
 # Cài đặt các gói cần thiết
 echo "Đang cài đặt các gói cần thiết..."
 apt-get install -y python3 python3-pip python3-setuptools git libsodium-dev qrencode curl jq
 
-# Hỏi thông tin cấu hình
-read -p "Nhập port server (mặc định: 8388): " server_port
-server_port=${server_port:-8388}
+# Tạo port ngẫu nhiên (1024-65535)
+server_port=$(shuf -i 10000-65000 -n 1)
+echo "Đã tạo port ngẫu nhiên: $server_port"
 
-read -p "Nhập mật khẩu (mặc định: tạo ngẫu nhiên): " password
-if [ -z "$password" ]; then
-  password=$(tr -dc 'A-Za-z0-9!@#$%^&*()' </dev/urandom | head -c 16)
-  echo "Đã tạo mật khẩu ngẫu nhiên: $password"
-fi
+# Tạo mật khẩu ngẫu nhiên
+password=$(tr -dc 'A-Za-z0-9!@#$%^&*()' </dev/urandom | head -c 16)
+echo "Đã tạo mật khẩu ngẫu nhiên: $password"
 
-read -p "Nhập phương thức mã hóa (mặc định: aes-256-gcm): " method
-method=${method:-aes-256-gcm}
+# Phương thức mã hóa mặc định là chacha20
+method="chacha20-ietf-poly1305"
 
 # Lấy địa chỉ IP public
 server_ip=$(curl -s https://api.ipify.org)
@@ -39,6 +36,10 @@ fi
 if [ -z "$server_ip" ]; then
   read -p "Không thể tự động lấy IP. Vui lòng nhập IP của server: " server_ip
 fi
+
+# Hỏi tên cho cấu hình SSR
+read -p "Nhập tên cho cấu hình SSR (mặc định: MySSR): " ssr_name
+ssr_name=${ssr_name:-MySSR}
 
 # Cài đặt Shadowsocks
 echo "Đang cài đặt Shadowsocks..."
@@ -80,21 +81,21 @@ systemctl daemon-reload
 systemctl enable shadowsocks
 systemctl start shadowsocks
 
-# Cài đặt SSR nếu được yêu cầu
-read -p "Bạn có muốn cài đặt ShadowsocksR không? (y/n, mặc định: n): " install_ssr
-install_ssr=${install_ssr:-n}
+# Cài đặt SSR
+echo "Đang cài đặt ShadowsocksR..."
 
-if [[ "$install_ssr" == "y" || "$install_ssr" == "Y" ]]; then
-  echo "Đang cài đặt ShadowsocksR..."
-  
-  # Tải và cài đặt ShadowsocksR
-  cd /usr/local/
-  git clone https://github.com/shadowsocksrr/shadowsocksr.git
-  cd shadowsocksr
-  bash initcfg.sh
-  
-  # Tạo cấu hình SSR
-  cat > /usr/local/shadowsocksr/user-config.json << EOF
+# Tải và cài đặt ShadowsocksR
+cd /usr/local/
+git clone https://github.com/shadowsocksrr/shadowsocksr.git
+cd shadowsocksr
+bash initcfg.sh
+
+# Chọn protocol và obfs cho SSR
+protocol="origin"
+obfs="plain"
+
+# Tạo cấu hình SSR
+cat > /usr/local/shadowsocksr/user-config.json << EOF
 {
     "server": "0.0.0.0",
     "server_ipv6": "::",
@@ -103,9 +104,9 @@ if [[ "$install_ssr" == "y" || "$install_ssr" == "Y" ]]; then
     "local_port": 1080,
     "password": "$password",
     "method": "$method",
-    "protocol": "origin",
+    "protocol": "$protocol",
     "protocol_param": "",
-    "obfs": "plain",
+    "obfs": "$obfs",
     "obfs_param": "",
     "speed_limit_per_con": 0,
     "speed_limit_per_user": 0,
@@ -119,8 +120,8 @@ if [[ "$install_ssr" == "y" || "$install_ssr" == "Y" ]]; then
 }
 EOF
 
-  # Tạo service SSR
-  cat > /etc/systemd/system/ssr.service << EOF
+# Tạo service SSR
+cat > /etc/systemd/system/ssr.service << EOF
 [Unit]
 Description=ShadowsocksR Server
 After=network.target
@@ -133,62 +134,69 @@ Restart=on-abort
 WantedBy=multi-user.target
 EOF
 
-  systemctl daemon-reload
-  systemctl enable ssr
-  systemctl start ssr
-  
-  # Tạo link SSR
-  protocol="origin"
-  obfs="plain"
-  ssr_password=$(echo -n "$password" | base64 | tr -d '\n')
-  ssr_link="ssr://$server_ip:$server_port:$protocol:$method:$obfs:$ssr_password/?remarks=SSRServer"
-  
-  # Hiển thị thông tin SSR
-  echo "===================================="
-  echo "Thông tin ShadowsocksR của bạn:"
-  echo "===================================="
-  echo "Server IP: $server_ip"
-  echo "Server Port: $server_port"
-  echo "Password: $password"
-  echo "Encryption Method: $method"
-  echo "Protocol: $protocol"
-  echo "Obfs: $obfs"
-  echo "===================================="
-  echo "SSR Link: $ssr_link"
-  echo "===================================="
-  echo "SSR QR Code:"
-  echo -n "$ssr_link" | qrencode -t UTF8
-  echo "===================================="
-fi
+systemctl daemon-reload
+systemctl enable ssr
+systemctl start ssr
+
+# Chuẩn bị thông tin cho SSR link
+ssr_password=$(echo -n "$password" | base64 | tr -d '\n')
+ssr_remarks=$(echo -n "$ssr_name" | base64 | tr -d '\n')
+ssr_protocol_param=""
+ssr_obfs_param=""
+
+# Tạo link SSR với tên do người dùng nhập
+ssr_link="ssr://$server_ip:$server_port:$protocol:$method:$obfs:$ssr_password/?remarks=$ssr_remarks&protoparam=$ssr_protocol_param&obfsparam=$ssr_obfs_param"
 
 # Hiển thị thông tin Shadowsocks
 base64_str=$(echo -n "$method:$password@$server_ip:$server_port" | base64 | tr -d '\n')
-ss_link="ss://$base64_str"
+ss_link="ss://$base64_str#$ssr_name"
 
+# In thông tin
 echo "===================================="
-echo "Cài đặt hoàn tất! Shadowsocks đã được cài đặt và đang chạy."
+echo "Cài đặt hoàn tất! Shadowsocks và ShadowsocksR đã được cài đặt và đang chạy."
 echo "===================================="
-echo "Thông tin kết nối Shadowsocks:"
+echo "Thông tin kết nối:"
 echo "Server IP: $server_ip"
 echo "Server Port: $server_port"
 echo "Password: $password"
 echo "Encryption Method: $method"
+echo "Protocol: $protocol"
+echo "Obfs: $obfs"
+echo "Remarks: $ssr_name"
 echo "===================================="
 echo "Shadowsocks Link: $ss_link"
 echo "===================================="
 echo "Shadowsocks QR Code:"
 echo -n "$ss_link" | qrencode -t UTF8
 echo "===================================="
+echo "SSR Link: $ssr_link"
+echo "===================================="
+echo "SSR QR Code:"
+echo -n "$ssr_link" | qrencode -t UTF8
+echo "===================================="
 
 echo "Trạng thái dịch vụ Shadowsocks:"
 systemctl status shadowsocks --no-pager
 
-echo "Để kiểm tra cấu hình, chạy: nano /etc/shadowsocks/config.json"
-echo "Để khởi động lại dịch vụ sau khi thay đổi cấu hình, chạy: systemctl restart shadowsocks"
+echo "Trạng thái dịch vụ ShadowsocksR:"
+systemctl status ssr --no-pager
 
-if [[ "$install_ssr" == "y" || "$install_ssr" == "Y" ]]; then
-  echo "Trạng thái dịch vụ ShadowsocksR:"
-  systemctl status ssr --no-pager
-  echo "Để kiểm tra cấu hình SSR, chạy: nano /usr/local/shadowsocksr/user-config.json"
-  echo "Để khởi động lại dịch vụ SSR, chạy: systemctl restart ssr"
-fi
+echo "Lưu ý: Port đã được tạo ngẫu nhiên và có thể bị chặn bởi tường lửa."
+echo "Để mở port trên tường lửa UFW, chạy: sudo ufw allow $server_port/tcp && sudo ufw allow $server_port/udp"
+
+# Lưu thông tin vào file
+cat > shadowsocks_info.txt << EOF
+=== THÔNG TIN KẾT NỐI SHADOWSOCKS ===
+Server: $server_ip
+Port: $server_port
+Password: $password
+Method: $method
+Protocol: $protocol
+Obfs: $obfs
+Remarks: $ssr_name
+
+Shadowsocks Link: $ss_link
+SSR Link: $ssr_link
+EOF
+
+echo "Thông tin kết nối đã được lưu vào file shadowsocks_info.txt"
