@@ -1,6 +1,6 @@
 #!/bin/bash
-# Script tối ưu hóa và giám sát Shadowsocks
-# Sử dụng: chmod +x ss_optimize.sh && sudo ./ss_optimize.sh
+# Script tự động cài đặt, tối ưu và giám sát Shadowsocks
+# Sử dụng: chmod +x complete_ss.sh && sudo ./complete_ss.sh
 
 # Màu sắc
 RED='\033[0;31m'
@@ -15,40 +15,170 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
-# Lấy thông tin port từ cấu hình Shadowsocks hiện tại
-PORT_FOUND=false
+# Xóa cài đặt cũ nếu có
+echo -e "${YELLOW}Kiểm tra và xóa cài đặt cũ nếu tồn tại...${NC}"
+systemctl stop sing-box shadowsocks-libev ss-server 2>/dev/null
+systemctl disable sing-box shadowsocks-libev ss-server 2>/dev/null
+rm -f /etc/systemd/system/sing-box.service /etc/systemd/system/ss-server.service 2>/dev/null
+systemctl daemon-reload
 
-# Kiểm tra các file cấu hình phổ biến
-CONFIG_FILES=(
-  "/etc/shadowsocks-libev/config.json"
-  "/etc/shadowsocks.json"
-  "/usr/local/etc/shadowsocks.json"
-)
+# Cập nhật repository
+echo -e "${BLUE}Đang cập nhật danh sách package...${NC}"
+apt-get update -y
 
-for config_file in "${CONFIG_FILES[@]}"; do
-  if [ -f "$config_file" ]; then
-    echo -e "${BLUE}Đã tìm thấy file cấu hình: $config_file${NC}"
-    server_port=$(grep -o '"server_port":[^,]*' "$config_file" | grep -o '[0-9]*')
-    
-    if [ -n "$server_port" ]; then
-      echo -e "${GREEN}Đã tìm thấy port: $server_port${NC}"
-      PORT_FOUND=true
-      break
-    fi
-  fi
-done
+# Cài đặt các gói cần thiết
+echo -e "${BLUE}Đang cài đặt các gói cần thiết...${NC}"
+apt-get install -y curl wget jq qrencode unzip iptables shadowsocks-libev monit
 
-if [ "$PORT_FOUND" = false ]; then
-  echo -e "${YELLOW}Không tìm thấy port Shadowsocks. Đang yêu cầu nhập thủ công...${NC}"
-  read -p "Nhập port Shadowsocks: " server_port
-  
-  if [ -z "$server_port" ]; then
-    echo -e "${RED}Không có port được nhập. Không thể tiếp tục.${NC}"
-    exit 1
-  fi
+# Tạo port ngẫu nhiên (1024-65535)
+server_port=$(shuf -i 10000-60000 -n 1)
+echo -e "${GREEN}Đã tạo port ngẫu nhiên: ${server_port}${NC}"
+
+# Tạo mật khẩu ngẫu nhiên
+password=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 12)
+echo -e "${GREEN}Đã tạo mật khẩu ngẫu nhiên: ${password}${NC}"
+
+# Sử dụng phương thức mã hóa tối ưu và tương thích
+# Chọn aes-256-gcm hoặc aes-256-cfb là an toàn nhất cho tính tương thích
+method="aes-256-cfb"
+
+# Lấy địa chỉ IP public
+echo -e "${BLUE}Đang lấy địa chỉ IP public...${NC}"
+server_ip=$(curl -s https://api.ipify.org)
+if [ -z "$server_ip" ]; then
+  server_ip=$(curl -s http://ifconfig.me)
 fi
 
-echo -e "${BLUE}=== Bắt đầu tối ưu hóa Shadowsocks ===${NC}"
+if [ -z "$server_ip" ]; then
+  echo -e "${YELLOW}Không thể tự động lấy IP. Đang thử phương pháp khác...${NC}"
+  server_ip=$(ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v "127.0.0.1" | head -n 1)
+fi
+
+if [ -z "$server_ip" ]; then
+  read -p "Không thể tự động lấy IP. Vui lòng nhập IP của server: " server_ip
+fi
+
+echo -e "${GREEN}Địa chỉ IP của server: ${server_ip}${NC}"
+
+# Hỏi tên cho cấu hình
+read -p "Nhập tên cho cấu hình (mặc định: MySSServer): " config_name
+config_name=${config_name:-MySSServer}
+
+# Cấu hình shadowsocks-libev
+echo -e "${BLUE}Đang cấu hình Shadowsocks...${NC}"
+cat > /etc/shadowsocks-libev/config.json << EOF
+{
+    "server":"0.0.0.0",
+    "server_port":${server_port},
+    "password":"${password}",
+    "timeout":300,
+    "method":"${method}",
+    "fast_open":true,
+    "nameserver":"8.8.8.8",
+    "mode":"tcp_and_udp"
+}
+EOF
+
+# Mở port trên tường lửa
+echo -e "${BLUE}Đang cấu hình tường lửa...${NC}"
+# UFW
+if command -v ufw &> /dev/null; then
+    ufw allow $server_port/tcp
+    ufw allow $server_port/udp
+    echo -e "${GREEN}Đã mở port ${server_port} trên UFW.${NC}"
+fi
+
+# Iptables
+iptables -I INPUT -p tcp --dport $server_port -j ACCEPT
+iptables -I INPUT -p udp --dport $server_port -j ACCEPT
+echo -e "${GREEN}Đã mở port ${server_port} trên iptables.${NC}"
+
+# Khởi động lại dịch vụ shadowsocks-libev
+echo -e "${BLUE}Đang khởi động dịch vụ Shadowsocks...${NC}"
+systemctl restart shadowsocks-libev
+systemctl enable shadowsocks-libev
+sleep 2
+
+# Kiểm tra trạng thái dịch vụ
+if systemctl is-active --quiet shadowsocks-libev; then
+    echo -e "${GREEN}Dịch vụ Shadowsocks đã được khởi động thành công.${NC}"
+    service_name="shadowsocks-libev"
+else
+    echo -e "${RED}Dịch vụ Shadowsocks không khởi động được. Đang thử phương pháp thay thế...${NC}"
+    
+    # Thử cài đặt và cấu hình lại bằng ss-server trực tiếp
+    echo -e "${BLUE}Đang cấu hình ss-server trực tiếp...${NC}"
+    cat > /etc/systemd/system/ss-server.service << EOF
+[Unit]
+Description=Shadowsocks Server
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/ss-server -c /etc/shadowsocks-libev/config.json -u
+Restart=on-failure
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl start ss-server
+    systemctl enable ss-server
+    sleep 2
+    
+    if systemctl is-active --quiet ss-server; then
+        echo -e "${GREEN}Dịch vụ ss-server đã được khởi động thành công.${NC}"
+        service_name="ss-server"
+    else
+        echo -e "${RED}Không thể khởi động dịch vụ Shadowsocks. Đang cài đặt phương pháp cuối cùng...${NC}"
+        
+        # Thử cài đặt Python Shadowsocks
+        apt-get install -y python3-pip
+        pip3 install https://github.com/shadowsocks/shadowsocks/archive/master.zip
+        
+        # Tạo cấu hình Python Shadowsocks
+        cat > /etc/shadowsocks.json << EOF
+{
+    "server":"0.0.0.0",
+    "server_port":${server_port},
+    "password":"${password}",
+    "timeout":300,
+    "method":"${method}",
+    "fast_open":false
+}
+EOF
+
+        # Tạo service
+        cat > /etc/systemd/system/shadowsocks-python.service << EOF
+[Unit]
+Description=Shadowsocks Python Server
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/ssserver -c /etc/shadowsocks.json
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+        systemctl daemon-reload
+        systemctl start shadowsocks-python
+        systemctl enable shadowsocks-python
+        sleep 2
+        
+        if systemctl is-active --quiet shadowsocks-python; then
+            echo -e "${GREEN}Dịch vụ Shadowsocks Python đã được khởi động thành công.${NC}"
+            service_name="shadowsocks-python"
+        else
+            echo -e "${RED}Tất cả các phương pháp đều thất bại. Vui lòng kiểm tra logs để biết thêm chi tiết.${NC}"
+            exit 1
+        fi
+    fi
+fi
+
+echo -e "${BLUE}=== BẮT ĐẦU TỐI ƯU HIỆU SUẤT VÀ CÀI ĐẶT GIÁM SÁT ===${NC}"
 
 # 1. Bật BBR congestion control
 echo -e "${BLUE}Đang bật BBR congestion control...${NC}"
@@ -118,30 +248,7 @@ sysctl -p
 echo -e "${GREEN}Đã tối ưu hóa tham số kernel thành công!${NC}"
 
 # 3. Cài đặt và cấu hình giám sát với Monit
-echo -e "${BLUE}Đang cài đặt và cấu hình Monit để giám sát Shadowsocks...${NC}"
-
-# Cài đặt Monit
-apt-get update
-apt-get install -y monit
-
-# Xác định tên dịch vụ Shadowsocks
-if systemctl list-units --full -all | grep -q "shadowsocks-libev"; then
-  service_name="shadowsocks-libev"
-elif systemctl list-units --full -all | grep -q "ss-server"; then
-  service_name="ss-server"
-elif systemctl list-units --full -all | grep -q "shadowsocks-python"; then
-  service_name="shadowsocks-python"
-else
-  echo -e "${YELLOW}Không thể tự động xác định tên dịch vụ Shadowsocks.${NC}"
-  read -p "Nhập tên dịch vụ Shadowsocks (vd: shadowsocks-libev): " service_name
-  
-  if [ -z "$service_name" ]; then
-    echo -e "${RED}Tên dịch vụ không được nhập. Sử dụng giá trị mặc định 'shadowsocks-libev'.${NC}"
-    service_name="shadowsocks-libev"
-  fi
-fi
-
-echo -e "${GREEN}Đã xác định tên dịch vụ Shadowsocks: $service_name${NC}"
+echo -e "${BLUE}Đang cấu hình Monit để giám sát Shadowsocks...${NC}"
 
 # Tạo file cấu hình Monit cho Shadowsocks
 cat > /etc/monit/conf.d/shadowsocks << EOF
@@ -200,18 +307,73 @@ chmod +x /usr/local/bin/check_shadowsocks.sh
 
 echo -e "${GREEN}Đã tạo script kiểm tra và cronjob để giám sát Shadowsocks mỗi 5 phút!${NC}"
 
-# Hiển thị trạng thái cuối cùng
-echo -e "${BLUE}=== Tối ưu hóa và giám sát hoàn tất ===${NC}"
+# Tạo URI và QR code cho Shadowsocks
+ss_base64=$(echo -n "${method}:${password}" | base64 -w 0)
+ss_link="ss://${ss_base64}@${server_ip}:${server_port}#${config_name}"
+
+# In thông tin
+echo -e "${GREEN}===================================${NC}"
+echo -e "${GREEN}Cài đặt, tối ưu và giám sát hoàn tất!${NC}"
+echo -e "${GREEN}===================================${NC}"
+echo -e "${YELLOW}Thông tin kết nối Shadowsocks:${NC}"
+echo -e "Server IP: ${server_ip}"
+echo -e "Server Port: ${server_port}"
+echo -e "Password: ${password}"
+echo -e "Method: ${method}"
+echo -e "${GREEN}===================================${NC}"
+echo -e "${YELLOW}Shadowsocks Link:${NC} ${ss_link}"
+echo -e "${GREEN}===================================${NC}"
+echo -e "${YELLOW}Shadowsocks QR Code:${NC}"
+echo -n "${ss_link}" | qrencode -t UTF8
+echo -e "${GREEN}===================================${NC}"
+
+# Kiểm tra kết nối
+echo -e "${BLUE}Đang kiểm tra kết nối...${NC}"
+if ss -tuln | grep -q ":$server_port "; then
+    echo -e "${GREEN}Cổng ${server_port} đang mở và lắng nghe kết nối.${NC}"
+else
+    echo -e "${RED}Cổng ${server_port} không mở. Vui lòng kiểm tra cấu hình tường lửa.${NC}"
+fi
+
+# Hiển thị trạng thái tối ưu hóa
+echo -e "${BLUE}=== Trạng thái tối ưu hóa ===${NC}"
 echo -e "${GREEN}BBR congestion control: $(sysctl net.ipv4.tcp_congestion_control | grep -q bbr && echo "Bật" || echo "Tắt")${NC}"
 echo -e "${GREEN}Tối ưu hóa kernel: Đã áp dụng${NC}"
 echo -e "${GREEN}Giám sát Monit: Đã cấu hình${NC}"
 echo -e "${GREEN}Cronjob kiểm tra: Mỗi 5 phút${NC}"
 
-echo -e "${YELLOW}Để kiểm tra trạng thái Monit:${NC} sudo monit status"
-echo -e "${YELLOW}Để xem log giám sát:${NC} cat /var/log/shadowsocks_monitor.log"
-echo -e "${YELLOW}Để kiểm tra BBR:${NC} sysctl net.ipv4.tcp_congestion_control"
+# Lưu thông tin vào file
+cat > shadowsocks_info.txt << EOF
+=== THÔNG TIN KẾT NỐI SHADOWSOCKS ===
+Server: ${server_ip}
+Port: ${server_port}
+Password: ${password}
+Method: ${method}
+Remarks: ${config_name}
 
-echo -e "${GREEN}Tối ưu hóa hoàn tất! Shadowsocks của bạn giờ đây sẽ:${NC}"
-echo -e "  ${GREEN}- Có hiệu suất tốt hơn với BBR${NC}"
+Shadowsocks Link: ${ss_link}
+
+=== THÔNG TIN TỐI ƯU HÓA ===
+BBR: $(sysctl net.ipv4.tcp_congestion_control | grep -q bbr && echo "Bật" || echo "Tắt")
+Tối ưu kernel: Đã áp dụng
+Giám sát: Monit + Cronjob (5 phút)
+EOF
+
+echo -e "${GREEN}Thông tin kết nối và tối ưu hóa đã được lưu vào file shadowsocks_info.txt${NC}"
+
+# Hướng dẫn khắc phục sự cố
+echo -e "${YELLOW}"
+echo "HƯỚNG DẪN KHẮC PHỤC SỰ CỐ:"
+echo "1. Kiểm tra log: sudo journalctl -u $service_name -f"
+echo "2. Kiểm tra cổng đã mở: sudo lsof -i :$server_port"
+echo "3. Kiểm tra tường lửa: sudo iptables -L | grep $server_port"
+echo "4. Khởi động lại dịch vụ: sudo systemctl restart $service_name"
+echo "5. Kiểm tra trạng thái Monit: sudo monit status"
+echo "6. Xem log giám sát: cat /var/log/shadowsocks_monitor.log"
+echo -e "${NC}"
+
+echo -e "${GREEN}Cài đặt hoàn tất! Shadowsocks của bạn đã được:${NC}"
+echo -e "  ${GREEN}- Cài đặt với cấu hình tối ưu${NC}"
+echo -e "  ${GREEN}- Tăng hiệu suất với BBR${NC}"
+echo -e "  ${GREEN}- Được bảo vệ bằng hệ thống giám sát hai lớp${NC}"
 echo -e "  ${GREEN}- Tự động khởi động lại nếu gặp sự cố${NC}"
-echo -e "  ${GREEN}- Được giám sát thường xuyên${NC}"
